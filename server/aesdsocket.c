@@ -17,7 +17,15 @@
 #include <unistd.h>
 
 #define PORT 9000
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
 #define BUFFER_SIZE 1024
 #define TIMESTAMP_INTERVAL_SECONDS 10
 
@@ -36,11 +44,13 @@ static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
 static client_thread_t *thread_list = NULL;
 
+#if !USE_AESD_CHAR_DEVICE
 static pthread_t timestamp_thread_id;
 static bool timestamp_thread_started = false;
 static bool timestamp_stop_requested = false;
 static pthread_mutex_t timestamp_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t timestamp_condition = PTHREAD_COND_INITIALIZER;
+#endif
 
 static void signal_handler(int signal_number)
 {
@@ -191,7 +201,11 @@ static int append_and_return_file(int client_fd,
         return -1;
     }
 
+#if USE_AESD_CHAR_DEVICE
+    data_fd = open(DATA_FILE, O_WRONLY);
+#else
     data_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+#endif
     if (data_fd < 0 || write_all(data_fd, packet, packet_length) != 0) {
         goto cleanup;
     }
@@ -234,6 +248,7 @@ cleanup:
     return result;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 static int append_timestamp(void)
 {
     time_t now;
@@ -355,6 +370,8 @@ static void stop_timestamp_thread(void)
     pthread_join(timestamp_thread_id, NULL);
     timestamp_thread_started = false;
 }
+
+#endif
 
 static void *client_worker(void *argument)
 {
@@ -498,7 +515,9 @@ int main(int argc, char *argv[])
     sigaction(SIGTERM, &action, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
+#endif
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -532,10 +551,12 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (start_timestamp_thread() != 0) {
         syslog(LOG_ERR, "Failed to start timestamp thread");
         goto cleanup;
     }
+#endif
 
     while (!exit_requested) {
         fd_set read_fds;
@@ -629,16 +650,22 @@ cleanup:
     }
 
     request_client_threads_exit();
+#if !USE_AESD_CHAR_DEVICE
     stop_timestamp_thread();
+#endif
     join_all_client_threads();
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
+#endif
 
     if (exit_requested) {
         syslog(LOG_INFO, "Caught signal, exiting");
     }
 
+#if !USE_AESD_CHAR_DEVICE
     pthread_cond_destroy(&timestamp_condition);
     pthread_mutex_destroy(&timestamp_mutex);
+#endif
     pthread_mutex_destroy(&list_mutex);
     pthread_mutex_destroy(&file_mutex);
     closelog();
