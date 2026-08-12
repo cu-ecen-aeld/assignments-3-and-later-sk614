@@ -4,6 +4,10 @@
  *  Created on: Oct 23, 2019
  *      Author: Dan Walkes
  */
+ 
+#include <linux/cdev.h>
+#include <linux/mutex.h>
+#include "aesd-circular-buffer.h"
 
 #ifndef AESD_CHAR_DRIVER_AESDCHAR_H_
 #define AESD_CHAR_DRIVER_AESDCHAR_H_
@@ -25,10 +29,20 @@
 
 struct aesd_dev
 {
-    /**
-     * TODO: Add structure(s) and locks needed to complete assignment requirements
+    struct cdev cdev;
+
+    /* Stores the most recent 10 completed write commands */
+    struct aesd_circular_buffer buffer;
+
+    /* Protects reads/writes and circular buffer manipulation */
+    struct mutex lock;
+
+    /*
+     * Holds a write which has not yet been terminated with '\n'.
+     * Future writes are appended here until the command is complete.
      */
-    struct cdev cdev;     /* Char device structure      */
+    char *pending_buf;
+    size_t pending_size;
 };
 
 
