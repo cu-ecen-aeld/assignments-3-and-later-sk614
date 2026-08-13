@@ -21,6 +21,8 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -179,12 +181,142 @@ out:
     mutex_unlock(&dev->lock);
     return retval;
 }
+
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_buffer_entry *entry;
+    uint8_t index;
+    loff_t total_size = 0;
+    loff_t retval;
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    /*
+     * Determine the total number of bytes currently stored in
+     * the circular buffer.  Pending data which has not yet
+     * terminated with a newline is not part of the readable
+     * circular buffer.
+     */
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
+        total_size += entry->size;
+    }
+
+    /*
+     * fixed_size_llseek supports SEEK_SET, SEEK_CUR and SEEK_END
+     * and updates filp->f_pos.
+     */
+    retval = fixed_size_llseek(filp, offset, whence, total_size);
+
+    mutex_unlock(&dev->lock);
+
+    return retval;
+}
+
+long aesd_unlocked_ioctl(struct file *filp,
+                         unsigned int cmd,
+                         unsigned long arg)
+{
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    uint8_t num_entries;
+    uint8_t index;
+    uint8_t count;
+    loff_t new_fpos = 0;
+    struct aesd_buffer_entry *entry;
+
+    /*
+     * Only AESDCHAR_IOCSEEKTO is supported.
+     */
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC ||
+        _IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) {
+        return -ENOTTY;
+    }
+
+    if (cmd != AESDCHAR_IOCSEEKTO) {
+        return -ENOTTY;
+    }
+
+    /*
+     * Copy write_cmd and write_cmd_offset from userspace.
+     */
+    if (copy_from_user(&seekto,
+                       (const void __user *)arg,
+                       sizeof(seekto))) {
+        return -EFAULT;
+    }
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    /*
+     * Determine how many complete write commands are currently
+     * stored in the circular buffer.
+     */
+    num_entries = dev->buffer.full ?
+        AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED :
+        dev->buffer.in_offs;
+
+    /*
+     * write_cmd is zero referenced relative to the oldest
+     * command currently stored.
+     */
+    if (seekto.write_cmd >= num_entries) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    /*
+     * Translate write_cmd into the physical circular-buffer
+     * array index.
+     */
+    index = (dev->buffer.out_offs + seekto.write_cmd) %
+            AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+    entry = &dev->buffer.entry[index];
+
+    /*
+     * Offset must point to a byte contained within the command.
+     */
+    if (seekto.write_cmd_offset >= entry->size) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    /*
+     * Calculate the absolute byte position by summing the
+     * commands before write_cmd.
+     */
+    index = dev->buffer.out_offs;
+
+    for (count = 0; count < seekto.write_cmd; count++) {
+        new_fpos += dev->buffer.entry[index].size;
+
+        index = (index + 1) %
+                AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    new_fpos += seekto.write_cmd_offset;
+
+    filp->f_pos = new_fpos;
+
+    mutex_unlock(&dev->lock);
+
+    return 0;
+}
+
+
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner =            THIS_MODULE,
+    .read =             aesd_read,
+    .write =            aesd_write,
+    .open =             aesd_open,
+    .release =          aesd_release,
+    .llseek =           aesd_llseek,
+    .unlocked_ioctl =   aesd_unlocked_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)

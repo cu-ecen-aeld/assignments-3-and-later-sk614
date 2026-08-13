@@ -16,6 +16,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../aesd-char-driver/aesd_ioctl.h"
+
 #define PORT 9000
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -189,6 +191,87 @@ static int receive_packet(int client_fd, char **packet, size_t *packet_length)
  * to that client.  The same mutex protects both this operation and timestamp
  * writes so no two records can be intermixed.
  */
+
+#if USE_AESD_CHAR_DEVICE
+static bool parse_seek_command(const char *packet,
+                               size_t packet_length,
+                               struct aesd_seekto *seekto)
+{
+    static const char prefix[] = "AESDCHAR_IOCSEEKTO:";
+    const size_t prefix_length = sizeof(prefix) - 1;
+    const char *cursor;
+    const char *end;
+    uint64_t value;
+
+    if (packet_length < prefix_length ||
+        memcmp(packet, prefix, prefix_length) != 0) {
+        return false;
+    }
+
+    cursor = packet + prefix_length;
+    end = packet + packet_length;
+
+    /*
+     * Parse write_cmd.
+     */
+    if (cursor >= end || *cursor < '0' || *cursor > '9') {
+        return false;
+    }
+
+    value = 0;
+
+    while (cursor < end && *cursor >= '0' && *cursor <= '9') {
+        value = value * 10 + (uint64_t)(*cursor - '0');
+
+        if (value > UINT32_MAX) {
+            return false;
+        }
+
+        cursor++;
+    }
+
+    if (cursor >= end || *cursor != ',') {
+        return false;
+    }
+
+    seekto->write_cmd = (uint32_t)value;
+    cursor++;
+
+    /*
+     * Parse write_cmd_offset.
+     */
+    if (cursor >= end || *cursor < '0' || *cursor > '9') {
+        return false;
+    }
+
+    value = 0;
+
+    while (cursor < end && *cursor >= '0' && *cursor <= '9') {
+        value = value * 10 + (uint64_t)(*cursor - '0');
+
+        if (value > UINT32_MAX) {
+            return false;
+        }
+
+        cursor++;
+    }
+
+    seekto->write_cmd_offset = (uint32_t)value;
+
+    /*
+     * Socket packets normally include the terminating newline.
+     */
+    if (cursor < end && *cursor == '\n') {
+        cursor++;
+    }
+
+    /*
+     * Nothing else is allowed after X,Y except the newline.
+     */
+    return cursor == end;
+}
+#endif
+
 static int append_and_return_file(int client_fd,
                                   const char *packet,
                                   size_t packet_length)
@@ -197,16 +280,67 @@ static int append_and_return_file(int client_fd,
     int result = -1;
     char buffer[BUFFER_SIZE];
 
+#if USE_AESD_CHAR_DEVICE
+    struct aesd_seekto seekto;
+    bool is_seek_command;
+#endif
+
     if (pthread_mutex_lock(&file_mutex) != 0) {
         return -1;
     }
 
 #if USE_AESD_CHAR_DEVICE
-    data_fd = open(DATA_FILE, O_WRONLY);
+
+    /*
+     * Check whether this packet is the Assignment 9 seek command.
+     */
+    is_seek_command =
+        parse_seek_command(packet, packet_length, &seekto);
+
+    /*
+     * Keep this descriptor open through the write/ioctl AND read.
+     * This is required so ioctl changes to f_pos are preserved.
+     */
+    data_fd = open(DATA_FILE, O_RDWR);
+    if (data_fd < 0) {
+        goto cleanup;
+    }
+
+    if (is_seek_command) {
+        /*
+         * Do NOT write AESDCHAR_IOCSEEKTO:X,Y into the device.
+         *
+         * Instead, issue the ioctl.  This changes data_fd's
+         * current file position.
+         */
+        if (ioctl(data_fd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+            goto cleanup;
+        }
+    } else {
+        /*
+         * Normal packet: write it to aesdchar.
+         */
+        if (write_all(data_fd, packet, packet_length) != 0) {
+            goto cleanup;
+        }
+
+        /*
+         * Normal socket writes return all current aesdchar
+         * contents, so start reading from offset zero.
+         */
+        if (lseek(data_fd, 0, SEEK_SET) < 0) {
+            goto cleanup;
+        }
+    }
+
 #else
+
+    /*
+     * Original Assignment 6 file-backed implementation.
+     */
     data_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
-#endif
-    if (data_fd < 0 || write_all(data_fd, packet, packet_length) != 0) {
+    if (data_fd < 0 ||
+        write_all(data_fd, packet, packet_length) != 0) {
         goto cleanup;
     }
 
@@ -214,6 +348,7 @@ static int append_and_return_file(int client_fd,
         data_fd = -1;
         goto cleanup;
     }
+
     data_fd = -1;
 
     data_fd = open(DATA_FILE, O_RDONLY);
@@ -221,6 +356,14 @@ static int append_and_return_file(int client_fd,
         goto cleanup;
     }
 
+#endif
+
+    /*
+     * For an ioctl request, this read uses the SAME file descriptor
+     * on which ioctl changed f_pos.
+     *
+     * For a normal request, f_pos was explicitly reset to zero.
+     */
     for (;;) {
         ssize_t bytes = read(data_fd, buffer, sizeof(buffer));
 
@@ -228,11 +371,14 @@ static int append_and_return_file(int client_fd,
             if (errno == EINTR) {
                 continue;
             }
+
             goto cleanup;
         }
+
         if (bytes == 0) {
             break;
         }
+
         if (send_all(client_fd, buffer, (size_t)bytes) != 0) {
             goto cleanup;
         }
@@ -244,7 +390,9 @@ cleanup:
     if (data_fd >= 0) {
         close(data_fd);
     }
+
     pthread_mutex_unlock(&file_mutex);
+
     return result;
 }
 
